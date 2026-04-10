@@ -4,9 +4,11 @@
   "description": "Shared chassis for PublicWerx projects: auth middleware (RS256 via auth.surajshetty.com) and system health/deploy routes.",
   "main": "index.js",
   "files": ["index.js", "auth.js", "system.js"],
+  "dependencies": {
+    "jsonwebtoken": "^9.0.0"
+  },
   "peerDependencies": {
-    "express": ">=4",
-    "jsonwebtoken": ">=9"
+    "express": ">=4"
   },
   "license": "UNLICENSED",
   "private": true
