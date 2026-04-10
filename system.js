@@ -33,6 +33,10 @@ const express = require('express');
  *                                                   When the consumer passes __dirname, we resolve from there.
  * @param {number}  [opts.deployTimeout=300000]   — ms before the deploy child process is killed.
  * @param {number}  [opts.maxOutputBytes=65536]   — cap on deploy stdout+stderr buffered in memory.
+ * @param {Object}  [opts.backup]                 — enable backup endpoints. Omit to disable.
+ * @param {string}  opts.backup.dbPath            — absolute path to the SQLite database file.
+ * @param {string}  [opts.backup.dir]             — backup directory. Defaults to {projectRoot}/backups.
+ * @param {number}  [opts.backup.maxBackups=14]   — max backups to keep (oldest pruned on create).
  */
 function createSystemRoutes(opts = {}) {
   if (!opts.systemKey) {
@@ -43,6 +47,8 @@ function createSystemRoutes(opts = {}) {
   const DEPLOY_TIMEOUT = opts.deployTimeout || 300000;
   const MAX_OUTPUT = opts.maxOutputBytes || 65536;
   const DEPLOY_SCRIPT = opts.deployScript || 'deploy.sh';
+  const BACKUP = opts.backup || null;
+  const MAX_BACKUPS = BACKUP ? (BACKUP.maxBackups || 14) : 0;
 
   const router = express.Router();
 
@@ -85,6 +91,7 @@ function createSystemRoutes(opts = {}) {
     } catch {}
 
     res.json({
+      features: { backup: !!BACKUP },
       host: os.hostname(),
       platform: `${os.type()} ${os.release()}`,
       nodeVersion: process.version,
@@ -152,6 +159,85 @@ function createSystemRoutes(opts = {}) {
       res.status(500).json({ error: err.message, output });
     });
   });
+
+  // ── Backup routes (opt-in) ───────────────────────────────────────────────
+  if (BACKUP) {
+    const backupDir = BACKUP.dir
+      || path.join(opts.projectRoot ? path.resolve(opts.projectRoot) : process.cwd(), 'backups');
+
+    // GET /backups — list available backups
+    router.get('/backups', (req, res) => {
+      try {
+        if (!fs.existsSync(backupDir)) return res.json([]);
+        const files = fs.readdirSync(backupDir)
+          .filter(f => f.endsWith('.db.gz'))
+          .map(f => {
+            const stat = fs.statSync(path.join(backupDir, f));
+            return { filename: f, size: stat.size, created: stat.mtime.toISOString() };
+          })
+          .sort((a, b) => b.created.localeCompare(a.created));
+        res.json(files);
+      } catch (err) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    // POST /backups — create a new backup
+    router.post('/backups', (req, res) => {
+      try {
+        if (!fs.existsSync(BACKUP.dbPath)) {
+          return res.status(500).json({ error: 'Database not found' });
+        }
+        fs.mkdirSync(backupDir, { recursive: true });
+
+        const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '_').slice(0, 15);
+        const backupFile = path.join(backupDir, `backup_${stamp}.db`);
+
+        // VACUUM INTO creates a consistent WAL-safe snapshot
+        const Database = require('better-sqlite3');
+        const db = new Database(BACKUP.dbPath, { readonly: true });
+        db.exec(`VACUUM INTO '${backupFile.replace(/'/g, "''")}'`);
+        db.close();
+
+        // Compress
+        const { execSync: ex } = require('child_process');
+        ex(`gzip "${backupFile}"`, { timeout: 30000 });
+
+        const gzFile = `backup_${stamp}.db.gz`;
+        const stat = fs.statSync(path.join(backupDir, gzFile));
+
+        // Prune oldest if over limit
+        const all = fs.readdirSync(backupDir)
+          .filter(f => f.endsWith('.db.gz'))
+          .sort();
+        while (all.length > MAX_BACKUPS) {
+          fs.unlinkSync(path.join(backupDir, all.shift()));
+        }
+
+        res.json({ ok: true, filename: gzFile, size: stat.size });
+      } catch (err) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    // DELETE /backups/:filename — remove a specific backup
+    router.delete('/backups/:filename', (req, res) => {
+      const filename = path.basename(req.params.filename);
+      if (!filename.endsWith('.db.gz')) {
+        return res.status(400).json({ error: 'Invalid filename' });
+      }
+      const filePath = path.join(backupDir, filename);
+      if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'Backup not found' });
+      }
+      try {
+        fs.unlinkSync(filePath);
+        res.json({ ok: true });
+      } catch (err) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+  }
 
   return router;
 }

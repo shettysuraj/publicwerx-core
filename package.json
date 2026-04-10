@@ -8,7 +8,11 @@
     "jsonwebtoken": "^9.0.0"
   },
   "peerDependencies": {
-    "express": ">=4"
+    "express": ">=4",
+    "better-sqlite3": ">=11"
+  },
+  "peerDependenciesMeta": {
+    "better-sqlite3": { "optional": true }
   },
   "license": "UNLICENSED",
   "private": true
