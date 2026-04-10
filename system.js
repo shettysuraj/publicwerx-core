@@ -35,6 +35,7 @@ const express = require('express');
  * @param {number}  [opts.maxOutputBytes=65536]   — cap on deploy stdout+stderr buffered in memory.
  * @param {Object}  [opts.backup]                 — enable backup endpoints. Omit to disable.
  * @param {string}  opts.backup.dbPath            — absolute path to the SQLite database file.
+ * @param {string}  opts.backup.label             — backup filename prefix, e.g. 'peerlinq.org_db'.
  * @param {string}  [opts.backup.dir]             — backup directory. Defaults to {projectRoot}/backups.
  * @param {number}  [opts.backup.maxBackups=14]   — max backups to keep (oldest pruned on create).
  */
@@ -191,7 +192,8 @@ function createSystemRoutes(opts = {}) {
         fs.mkdirSync(backupDir, { recursive: true });
 
         const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '_').slice(0, 15);
-        const backupFile = path.join(backupDir, `backup_${stamp}.db`);
+        const label = BACKUP.label || 'backup';
+        const backupFile = path.join(backupDir, `${label}_${stamp}.db`);
 
         // VACUUM INTO creates a consistent WAL-safe snapshot
         const Database = require('better-sqlite3');
@@ -203,7 +205,7 @@ function createSystemRoutes(opts = {}) {
         const { execSync: ex } = require('child_process');
         ex(`gzip "${backupFile}"`, { timeout: 30000 });
 
-        const gzFile = `backup_${stamp}.db.gz`;
+        const gzFile = `${label}_${stamp}.db.gz`;
         const stat = fs.statSync(path.join(backupDir, gzFile));
 
         // Prune oldest if over limit
