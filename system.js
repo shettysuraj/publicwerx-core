@@ -18,10 +18,111 @@
 //   }));
 
 const os = require('os');
-const { execSync, spawn } = require('child_process');
+const crypto = require('crypto');
+const { execSync, execFileSync, spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const express = require('express');
+
+// ── Lean S3 upload — zero deps, just crypto + fetch ──────────────────────
+// AWS Signature Version 4 signing for S3 PUT, using EC2 instance role creds.
+
+const S3_REGION = 'us-east-1';
+
+function hmacSha256(key, data) {
+  return crypto.createHmac('sha256', key).update(data).digest();
+}
+
+function sha256Hex(data) {
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+/** Fetch temporary credentials from EC2 Instance Metadata Service (IMDSv2). */
+async function getInstanceCredentials() {
+  // Step 1: get a session token
+  const tokenRes = await fetch('http://169.254.169.254/latest/api/token', {
+    method: 'PUT',
+    headers: { 'X-aws-ec2-metadata-token-ttl-seconds': '60' },
+  });
+  const token = await tokenRes.text();
+
+  // Step 2: get the role name
+  const roleRes = await fetch(
+    'http://169.254.169.254/latest/meta-data/iam/security-credentials/',
+    { headers: { 'X-aws-ec2-metadata-token': token } },
+  );
+  const role = (await roleRes.text()).trim();
+
+  // Step 3: get credentials for the role
+  const credRes = await fetch(
+    `http://169.254.169.254/latest/meta-data/iam/security-credentials/${role}`,
+    { headers: { 'X-aws-ec2-metadata-token': token } },
+  );
+  return credRes.json();
+}
+
+/** Upload a buffer to S3 using a signed PUT request. */
+async function s3Put(bucket, key, body) {
+  const creds = await getInstanceCredentials();
+  const host = `${bucket}.s3.${S3_REGION}.amazonaws.com`;
+  const now = new Date();
+  const dateStamp = now.toISOString().replace(/[-:]/g, '').slice(0, 8);        // YYYYMMDD
+  const amzDate = now.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z/, 'Z'); // YYYYMMDDTHHmmssZ
+  const payloadHash = sha256Hex(body);
+
+  const headers = {
+    Host: host,
+    'x-amz-date': amzDate,
+    'x-amz-content-sha256': payloadHash,
+    'Content-Length': String(body.length),
+  };
+  // If using temporary credentials (instance role), include the session token
+  if (creds.Token) headers['x-amz-security-token'] = creds.Token;
+
+  // Canonical request
+  const sortedEntries = Object.entries(headers).sort(([a],[b]) => a.toLowerCase().localeCompare(b.toLowerCase()));
+  const canonHeaders = sortedEntries.map(([k,v]) => `${k.toLowerCase()}:${v}`).join('\n') + '\n';
+  const signedHeaders = sortedEntries.map(([k]) => k.toLowerCase()).join(';');
+
+  const canonicalRequest = [
+    'PUT',
+    `/${key}`,
+    '',  // no query string
+    canonHeaders,
+    signedHeaders,
+    payloadHash,
+  ].join('\n');
+
+  // String to sign
+  const scope = `${dateStamp}/${S3_REGION}/s3/aws4_request`;
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    scope,
+    sha256Hex(canonicalRequest),
+  ].join('\n');
+
+  // Signing key
+  let sigKey = hmacSha256(`AWS4${creds.SecretAccessKey}`, dateStamp);
+  sigKey = hmacSha256(sigKey, S3_REGION);
+  sigKey = hmacSha256(sigKey, 's3');
+  sigKey = hmacSha256(sigKey, 'aws4_request');
+
+  const signature = hmacSha256(sigKey, stringToSign).toString('hex');
+  const authorization = `AWS4-HMAC-SHA256 Credential=${creds.AccessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+  const res = await fetch(`https://${host}/${key}`, {
+    method: 'PUT',
+    headers: { ...headers, Authorization: authorization },
+    body,
+  });
+
+  if (!res.ok) {
+    const errBody = await res.text();
+    throw new Error(`S3 PUT failed (${res.status}): ${errBody}`);
+  }
+  return { bucket, key };
+}
 
 /**
  * @param {Object} opts
@@ -40,8 +141,7 @@ const express = require('express');
  * @param {number}  [opts.backup.maxBackups=14]   — max backups to keep (oldest pruned on create).
  * @param {string}  [opts.backup.s3Bucket]        — S3 bucket name. If set, backups are also uploaded
  *                                                   to s3://{bucket}/backups/{label}/{filename}.
- *                                                   Requires @aws-sdk/client-s3 as a peer dependency.
- *                                                   Uses IAM instance role credentials automatically.
+ *                                                   Uses EC2 IAM instance role credentials (IMDSv2).
  */
 function createSystemRoutes(opts = {}) {
   if (!opts.systemKey) {
@@ -213,7 +313,6 @@ function createSystemRoutes(opts = {}) {
         db.close();
 
         // Compress
-        const { execFileSync } = require('child_process');
         execFileSync('gzip', [backupFile], { timeout: 30000 });
 
         const gzFile = `${label}_${stamp}.db.gz`;
@@ -224,15 +323,9 @@ function createSystemRoutes(opts = {}) {
         let s3 = null;
         if (BACKUP.s3Bucket) {
           try {
-            const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
-            const client = new S3Client({});
             const s3Key = `backups/${label}/${gzFile}`;
-            await client.send(new PutObjectCommand({
-              Bucket: BACKUP.s3Bucket,
-              Key: s3Key,
-              Body: fs.readFileSync(gzPath),
-            }));
-            s3 = { bucket: BACKUP.s3Bucket, key: s3Key };
+            const result = await s3Put(BACKUP.s3Bucket, s3Key, fs.readFileSync(gzPath));
+            s3 = result;
           } catch (s3Err) {
             console.error('[publicwerx-core:backup] S3 upload failed:', s3Err.message);
             s3 = { error: s3Err.message };
