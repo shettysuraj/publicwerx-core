@@ -143,6 +143,13 @@ function createSystemRoutes(opts = {}) {
       }
     };
 
+    let responded = false;
+    const respond = (status, body) => {
+      if (responded) return;
+      responded = true;
+      res.status(status).json(body);
+    };
+
     const child = spawn('bash', [script], {
       cwd: projectRoot,
       timeout: DEPLOY_TIMEOUT,
@@ -153,11 +160,11 @@ function createSystemRoutes(opts = {}) {
     child.stderr.on('data', append);
 
     child.on('close', code => {
-      res.json({ ok: code === 0, exitCode: code, output });
+      respond(200, { ok: code === 0, exitCode: code, output });
     });
 
     child.on('error', err => {
-      res.status(500).json({ error: err.message, output });
+      respond(500, { error: err.message, output });
     });
   });
 
@@ -202,8 +209,8 @@ function createSystemRoutes(opts = {}) {
         db.close();
 
         // Compress
-        const { execSync: ex } = require('child_process');
-        ex(`gzip "${backupFile}"`, { timeout: 30000 });
+        const { execFileSync } = require('child_process');
+        execFileSync('gzip', [backupFile], { timeout: 30000 });
 
         const gzFile = `${label}_${stamp}.db.gz`;
         const stat = fs.statSync(path.join(backupDir, gzFile));
