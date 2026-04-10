@@ -132,8 +132,13 @@ async function s3Put(bucket, key, body) {
  *                                                   from this file's consumer (which matches the standard
  *                                                   layout: project/backend/src/index.js → project/).
  *                                                   When the consumer passes __dirname, we resolve from there.
- * @param {number}  [opts.deployTimeout=300000]   — ms before the deploy child process is killed.
+ * @param {number}  [opts.deployTimeout=300000]   — ms before SIGTERM is sent to the deploy process.
+ *                                                   SIGKILL follows 10s later if it's still alive.
  * @param {number}  [opts.maxOutputBytes=65536]   — cap on deploy stdout+stderr buffered in memory.
+ * @param {Function} [opts.onDeploy]              — optional callback({ event, ip, userAgent, exitCode,
+ *                                                   durationMs, outputBytes, truncated }). Called on
+ *                                                   deploy_started, deploy_completed, deploy_failed.
+ *                                                   Use for audit logging.
  * @param {Object}  [opts.backup]                 — enable backup endpoints. Omit to disable.
  * @param {string}  opts.backup.dbPath            — absolute path to the SQLite database file.
  * @param {string}  opts.backup.label             — backup filename prefix, e.g. 'peerlinq.org_db'.
@@ -150,10 +155,14 @@ function createSystemRoutes(opts = {}) {
 
   const SYSTEM_KEY = opts.systemKey;
   const DEPLOY_TIMEOUT = opts.deployTimeout || 300000;
+  const SIGKILL_GRACE = 10000;
   const MAX_OUTPUT = opts.maxOutputBytes || 65536;
   const DEPLOY_SCRIPT = opts.deployScript || 'deploy.sh';
   const BACKUP = opts.backup || null;
   const MAX_BACKUPS = BACKUP ? (BACKUP.maxBackups || 14) : 0;
+  const onDeploy = typeof opts.onDeploy === 'function' ? opts.onDeploy : null;
+
+  let deployInFlight = false;
 
   const router = express.Router();
 
@@ -227,10 +236,14 @@ function createSystemRoutes(opts = {}) {
   });
 
   // ── POST /deploy — Run the project's deploy script ──────────────────────
+  // Single-flight: rejects concurrent deploys with 409.
+  // Two-stage kill: SIGTERM at timeout, SIGKILL 10s later (bash doesn't
+  // reliably propagate signals to long-running children like npm ci).
   router.post('/deploy', (req, res) => {
-    // Resolve project root from the caller's perspective. If the consumer
-    // passed projectRoot, use it; otherwise assume standard layout where
-    // this middleware is mounted from project/backend/src/index.js (3 up).
+    if (deployInFlight) {
+      return res.status(409).json({ error: 'Deploy already in progress' });
+    }
+
     const projectRoot = opts.projectRoot
       ? path.resolve(opts.projectRoot)
       : path.resolve(process.cwd());
@@ -240,35 +253,80 @@ function createSystemRoutes(opts = {}) {
       return res.status(500).json({ error: `${DEPLOY_SCRIPT} not found at ${projectRoot}` });
     }
 
-    let output = '';
-    const append = (chunk) => {
-      if (output.length < MAX_OUTPUT) {
-        output += chunk.toString().slice(0, MAX_OUTPUT - output.length);
-      }
-    };
+    deployInFlight = true;
+    const startedAt = Date.now();
+    const callerIp = req.ip || null;
+    const userAgent = (req.get('user-agent') || '').slice(0, 512) || null;
 
-    let responded = false;
-    const respond = (status, body) => {
-      if (responded) return;
-      responded = true;
-      res.status(status).json(body);
+    if (onDeploy) onDeploy({ event: 'deploy_started', ip: callerIp, userAgent });
+
+    const chunks = [];
+    let outputBytes = 0;
+    let truncated = false;
+    const appendOutput = (buf) => {
+      if (truncated) return;
+      const remaining = MAX_OUTPUT - outputBytes;
+      if (buf.length <= remaining) {
+        chunks.push(buf);
+        outputBytes += buf.length;
+        return;
+      }
+      if (remaining > 0) {
+        chunks.push(buf.subarray(0, remaining));
+        outputBytes += remaining;
+      }
+      truncated = true;
     };
 
     const child = spawn('bash', [script], {
       cwd: projectRoot,
-      timeout: DEPLOY_TIMEOUT,
       env: { ...process.env, PATH: process.env.PATH },
     });
 
-    child.stdout.on('data', append);
-    child.stderr.on('data', append);
+    child.stdout.on('data', appendOutput);
+    child.stderr.on('data', appendOutput);
 
-    child.on('close', code => {
-      respond(200, { ok: code === 0, exitCode: code, output });
+    let responded = false;
+    const finish = (fn) => {
+      if (responded) return;
+      responded = true;
+      deployInFlight = false;
+      if (sigtermTimer) clearTimeout(sigtermTimer);
+      if (sigkillTimer) clearTimeout(sigkillTimer);
+      fn();
+    };
+
+    // Two-stage kill: SIGTERM at deadline, SIGKILL after grace period
+    let sigkillTimer = null;
+    const sigtermTimer = setTimeout(() => {
+      try { child.kill('SIGTERM'); } catch {}
+      sigkillTimer = setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch {}
+      }, SIGKILL_GRACE);
+    }, DEPLOY_TIMEOUT);
+
+    child.on('close', (code) => {
+      finish(() => {
+        const output = Buffer.concat(chunks).toString('utf8')
+          + (truncated ? '\n[output truncated at 64KB]' : '');
+        const durationMs = Date.now() - startedAt;
+        if (onDeploy) onDeploy({
+          event: code === 0 ? 'deploy_completed' : 'deploy_failed',
+          ip: callerIp, userAgent, exitCode: code,
+          durationMs, outputBytes, truncated,
+        });
+        res.json({ ok: code === 0, exitCode: code, output, truncated });
+      });
     });
 
-    child.on('error', err => {
-      respond(500, { error: err.message, output });
+    child.on('error', (err) => {
+      finish(() => {
+        if (onDeploy) onDeploy({
+          event: 'deploy_failed', ip: callerIp, userAgent,
+          error: err.message, durationMs: Date.now() - startedAt,
+        });
+        res.status(500).json({ error: err.message });
+      });
     });
   });
 
