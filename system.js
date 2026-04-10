@@ -38,6 +38,10 @@ const express = require('express');
  * @param {string}  opts.backup.label             — backup filename prefix, e.g. 'peerlinq.org_db'.
  * @param {string}  [opts.backup.dir]             — backup directory. Defaults to {projectRoot}/backups.
  * @param {number}  [opts.backup.maxBackups=14]   — max backups to keep (oldest pruned on create).
+ * @param {string}  [opts.backup.s3Bucket]        — S3 bucket name. If set, backups are also uploaded
+ *                                                   to s3://{bucket}/backups/{label}/{filename}.
+ *                                                   Requires @aws-sdk/client-s3 as a peer dependency.
+ *                                                   Uses IAM instance role credentials automatically.
  */
 function createSystemRoutes(opts = {}) {
   if (!opts.systemKey) {
@@ -191,7 +195,7 @@ function createSystemRoutes(opts = {}) {
     });
 
     // POST /backups — create a new backup
-    router.post('/backups', (req, res) => {
+    router.post('/backups', async (req, res) => {
       try {
         if (!fs.existsSync(BACKUP.dbPath)) {
           return res.status(500).json({ error: 'Database not found' });
@@ -213,7 +217,27 @@ function createSystemRoutes(opts = {}) {
         execFileSync('gzip', [backupFile], { timeout: 30000 });
 
         const gzFile = `${label}_${stamp}.db.gz`;
-        const stat = fs.statSync(path.join(backupDir, gzFile));
+        const gzPath = path.join(backupDir, gzFile);
+        const stat = fs.statSync(gzPath);
+
+        // Upload to S3 if configured (best-effort, don't fail the backup)
+        let s3 = null;
+        if (BACKUP.s3Bucket) {
+          try {
+            const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+            const client = new S3Client({});
+            const s3Key = `backups/${label}/${gzFile}`;
+            await client.send(new PutObjectCommand({
+              Bucket: BACKUP.s3Bucket,
+              Key: s3Key,
+              Body: fs.readFileSync(gzPath),
+            }));
+            s3 = { bucket: BACKUP.s3Bucket, key: s3Key };
+          } catch (s3Err) {
+            console.error('[publicwerx-core:backup] S3 upload failed:', s3Err.message);
+            s3 = { error: s3Err.message };
+          }
+        }
 
         // Prune oldest if over limit
         const all = fs.readdirSync(backupDir)
@@ -223,7 +247,7 @@ function createSystemRoutes(opts = {}) {
           fs.unlinkSync(path.join(backupDir, all.shift()));
         }
 
-        res.json({ ok: true, filename: gzFile, size: stat.size });
+        res.json({ ok: true, filename: gzFile, size: stat.size, s3 });
       } catch (err) {
         res.status(500).json({ error: err.message });
       }

@@ -9,10 +9,12 @@
   },
   "peerDependencies": {
     "express": ">=4",
-    "better-sqlite3": ">=11"
+    "better-sqlite3": ">=11",
+    "@aws-sdk/client-s3": ">=3"
   },
   "peerDependenciesMeta": {
-    "better-sqlite3": { "optional": true }
+    "better-sqlite3": { "optional": true },
+    "@aws-sdk/client-s3": { "optional": true }
   },
   "license": "UNLICENSED",
   "private": true
