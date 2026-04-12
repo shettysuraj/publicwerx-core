@@ -404,6 +404,57 @@ function createSystemRoutes(opts = {}) {
       }
     });
 
+    // POST /backups/restore — restore a backup (stops app, swaps DB, restarts)
+    router.post('/backups/restore', (req, res) => {
+      const { filename } = req.body || {};
+      if (!filename || !filename.endsWith('.db.gz')) {
+        return res.status(400).json({ error: 'filename required (must end in .db.gz)' });
+      }
+      const safeName = path.basename(filename);
+      const backupPath = path.join(backupDir, safeName);
+      if (!fs.existsSync(backupPath)) {
+        return res.status(404).json({ error: 'Backup not found' });
+      }
+      try {
+        // 1. Safety: create a pre-restore backup of the current DB
+        const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '_').slice(0, 15);
+        const label = BACKUP.label || 'backup';
+        const preRestoreName = `${label}_pre_restore_${stamp}.db`;
+        const preRestorePath = path.join(backupDir, preRestoreName);
+        fs.copyFileSync(BACKUP.dbPath, preRestorePath);
+        execFileSync('gzip', [preRestorePath], { timeout: 30000 });
+
+        // 2. Decompress the selected backup to a temp file
+        const tmpRestore = path.join(backupDir, '_restore_tmp.db');
+        execSync(`gunzip -c "${backupPath}" > "${tmpRestore}"`, { timeout: 30000 });
+
+        // 3. Validate the restored file is a valid SQLite DB
+        const Database = require('better-sqlite3');
+        const testDb = new Database(tmpRestore, { readonly: true });
+        testDb.prepare('SELECT 1').get(); // throws if corrupt
+        testDb.close();
+
+        // 4. Remove WAL/SHM files and swap the DB
+        const walPath = BACKUP.dbPath + '-wal';
+        const shmPath = BACKUP.dbPath + '-shm';
+        if (fs.existsSync(walPath)) fs.unlinkSync(walPath);
+        if (fs.existsSync(shmPath)) fs.unlinkSync(shmPath);
+        fs.renameSync(tmpRestore, BACKUP.dbPath);
+
+        res.json({
+          ok: true,
+          restored: safeName,
+          preRestoreBackup: `${preRestoreName}.gz`,
+          note: 'App must be restarted (pm2 restart) for the DB swap to take effect.',
+        });
+      } catch (err) {
+        // Clean up temp file on failure
+        const tmpRestore = path.join(backupDir, '_restore_tmp.db');
+        if (fs.existsSync(tmpRestore)) fs.unlinkSync(tmpRestore);
+        res.status(500).json({ error: err.message });
+      }
+    });
+
     // DELETE /backups/:filename — remove a specific backup
     router.delete('/backups/:filename', (req, res) => {
       const filename = path.basename(req.params.filename);
