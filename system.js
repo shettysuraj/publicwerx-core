@@ -480,6 +480,58 @@ function createSystemRoutes(opts = {}) {
     });
   }
 
+  // ── GET /security-logs — Suspicious nginx log entries since last pull ────
+  // Returns { events: [...], offset: <new_offset> }.
+  // Caller should pass ?offset=<n> to resume from where it left off.
+  // Parses the peerlinq nginx log format:
+  //   IP DOMAIN [TIMESTAMP] "METHOD PATH PROTO" STATUS "UA"
+  const NGINX_LOG = '/var/log/nginx/access-peerlinq.log';
+  const LOG_RE = /^(\S+)\s+(\S+)\s+\[([^\]]+)\]\s+"(\S+)\s+(\S+)\s+\S+"\s+(\d+)\s+"(.*)"$/;
+  const PROBE_RE = /\.env|wp-admin|wp-login|phpmyadmin|\.git|\.DS_Store|\/admin|\/config|\/backup|\/debug|\/actuator|\/solr|\/cgi-bin|\/shell|\/eval|\/vendor|\/telescope|\/elfinder|\/api\/auth|\/authorize|\/auth\/login|\/auth\/register|\/auth\/reset|\/auth\/refresh|\/auth\/public-key|\/login/i;
+  const MONTHS = { Jan:'01',Feb:'02',Mar:'03',Apr:'04',May:'05',Jun:'06',Jul:'07',Aug:'08',Sep:'09',Oct:'10',Nov:'11',Dec:'12' };
+
+  router.get('/security-logs', (req, res) => {
+    try {
+      if (!fs.existsSync(NGINX_LOG)) return res.json({ events: [], offset: 0 });
+
+      const filesize = fs.statSync(NGINX_LOG).size;
+      let offset = parseInt(req.query.offset, 10) || 0;
+      if (offset > filesize) offset = 0; // log rotated
+
+      if (offset === filesize) return res.json({ events: [], offset: filesize });
+
+      const events = [];
+      const stream = fs.readFileSync(NGINX_LOG, 'utf8');
+      const lines = stream.slice(offset).split('\n');
+
+      for (const line of lines) {
+        const m = line.match(LOG_RE);
+        if (!m) continue;
+        const [, ip, domain, tsRaw, method, reqPath, statusStr, ua] = m;
+        const status = parseInt(statusStr, 10);
+        if (status < 400 && !PROBE_RE.test(reqPath)) continue;
+
+        // Convert '12/Apr/2026:10:30:00 +0000' → '2026-04-12 10:30:00'
+        const p = tsRaw.split(/[/: ]/);
+        const ts = p.length >= 6
+          ? `${p[2]}-${MONTHS[p[1]] || '01'}-${p[0]} ${p[3]}:${p[4]}:${p[5]}`
+          : tsRaw;
+
+        events.push({
+          ip, domain, method: method.slice(0, 10),
+          path: reqPath.slice(0, 500), status,
+          ua: ua.slice(0, 500), ts,
+        });
+
+        if (events.length >= 500) break;
+      }
+
+      res.json({ events, offset: filesize });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   return router;
 }
 
