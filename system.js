@@ -445,8 +445,14 @@ function createSystemRoutes(opts = {}) {
           ok: true,
           restored: safeName,
           preRestoreBackup: `${preRestoreName}.gz`,
-          note: 'App must be restarted (pm2 restart) for the DB swap to take effect.',
         });
+
+        // Auto-restart the PM2 process so the app picks up the new DB.
+        // Runs after the response is sent — the caller gets the JSON first.
+        setTimeout(() => {
+          try { execSync('pm2 restart ' + process.env.pm_id, { timeout: 10000 }); }
+          catch { /* process is restarting, this will die */ }
+        }, 500);
       } catch (err) {
         // Clean up temp file on failure
         const tmpRestore = path.join(backupDir, '_restore_tmp.db');
