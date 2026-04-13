@@ -486,22 +486,14 @@ function createSystemRoutes(opts = {}) {
   //   2. Static JS bundles on disk (frontend builds)
   // Returns { pass, scanned, leaks[] } — NEVER sends actual secret values.
 
-  const SENSITIVE_KEY = /SECRET|KEY|PASSWORD|TOKEN|PRIVATE|CREDENTIAL|ANTHROPIC|VAPID|CRYPTO_WALLET|SES_|SMTP/i;
-  const SKIP_KEYS = new Set([
-    'PATH', 'HOME', 'USER', 'SHELL', 'LANG', 'TERM', 'PWD', 'LOGNAME',
-    'SHLVL', 'HOSTNAME', '_', 'NODE_ENV', 'PORT', 'BASE_URL', 'CLIENT_URL',
-    'PUBLIC_DIR', 'DATA_DIR', 'CORS_ORIGINS', 'AUTH_SERVICE_URL',
-    'AUTH_SERVICE_ISSUER', 'TRADING_PAIR', 'AWS_REGION', 'SUPER_ADMIN_EMAIL',
-    'FROM_EMAIL', 'ADMIN_EMAIL', 'ALERT_FROM',
-  ]);
+  const SENSITIVE_KEY = /SECRET|_KEY|PASSWORD|TOKEN|PRIVATE|CREDENTIAL|ANTHROPIC|VAPID|CRYPTO_WALLET|SES_|SMTP/i;
 
   function collectSecrets() {
     const secrets = {};
     for (const [key, val] of Object.entries(process.env)) {
       if (!val || val.length < 8) continue;
-      if (SKIP_KEYS.has(key)) continue;
       if (key.startsWith('npm_') || key.startsWith('NVM_') || key.startsWith('LC_')) continue;
-      if (SENSITIVE_KEY.test(key) || val.length >= 24) {
+      if (SENSITIVE_KEY.test(key)) {
         secrets[key] = val;
       }
     }
