@@ -480,6 +480,112 @@ function createSystemRoutes(opts = {}) {
     });
   }
 
+  // ── GET /secret-scan — Check for secret leakage in public surface ────────
+  // Reads process.env for sensitive values, then checks:
+  //   1. HTTP responses on localhost (public endpoints)
+  //   2. Static JS bundles on disk (frontend builds)
+  // Returns { pass, scanned, leaks[] } — NEVER sends actual secret values.
+
+  const SENSITIVE_KEY = /SECRET|KEY|PASSWORD|TOKEN|PRIVATE|CREDENTIAL|ANTHROPIC|VAPID|CRYPTO_WALLET|SES_|SMTP/i;
+  const SKIP_KEYS = new Set([
+    'PATH', 'HOME', 'USER', 'SHELL', 'LANG', 'TERM', 'PWD', 'LOGNAME',
+    'SHLVL', 'HOSTNAME', '_', 'NODE_ENV', 'PORT', 'BASE_URL', 'CLIENT_URL',
+    'PUBLIC_DIR', 'DATA_DIR', 'CORS_ORIGINS', 'AUTH_SERVICE_URL',
+    'AUTH_SERVICE_ISSUER', 'TRADING_PAIR', 'AWS_REGION', 'SUPER_ADMIN_EMAIL',
+    'FROM_EMAIL', 'ADMIN_EMAIL', 'ALERT_FROM',
+  ]);
+
+  function collectSecrets() {
+    const secrets = {};
+    for (const [key, val] of Object.entries(process.env)) {
+      if (!val || val.length < 8) continue;
+      if (SKIP_KEYS.has(key)) continue;
+      if (key.startsWith('npm_') || key.startsWith('NVM_') || key.startsWith('LC_')) continue;
+      if (SENSITIVE_KEY.test(key) || val.length >= 24) {
+        secrets[key] = val;
+      }
+    }
+    return secrets;
+  }
+
+  function findJsFiles(dir, depth = 0) {
+    if (depth >= 3) return [];
+    const results = [];
+    try {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory() && entry.name !== 'node_modules' && entry.name !== '.git') {
+          results.push(...findJsFiles(full, depth + 1));
+        } else if (entry.isFile() && (entry.name.endsWith('.js') || entry.name.endsWith('.html'))) {
+          results.push(full);
+        }
+      }
+    } catch {}
+    return results;
+  }
+
+  router.get('/secret-scan', async (req, res) => {
+    const port = process.env.PORT || 3000;
+    const secrets = collectSecrets();
+    const secretEntries = Object.entries(secrets);
+    const leaks = [];
+
+    // 1. HTTP probes — hit public endpoints on localhost
+    const probePaths = ['/', '/.env', '/.git/config', '/health'];
+    for (const p of probePaths) {
+      try {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 5000);
+        const r = await fetch(`http://127.0.0.1:${port}${p}`, { signal: ctrl.signal });
+        clearTimeout(timer);
+        const body = await r.text();
+        for (const [key, val] of secretEntries) {
+          if (body.includes(val)) {
+            leaks.push({ type: 'http', path: p, key, status: r.status });
+          }
+        }
+      } catch {}
+    }
+
+    // 2. Disk scan — frontend bundles served as static files
+    const projectRoot = opts.projectRoot ? path.resolve(opts.projectRoot) : process.cwd();
+    const staticDirs = [
+      path.join(projectRoot, 'public'),
+      path.join(projectRoot, 'backend', 'public'),
+      path.join(projectRoot, 'frontend', 'dist'),
+      path.join(projectRoot, 'dist'),
+    ];
+
+    for (const dir of staticDirs) {
+      if (!fs.existsSync(dir)) continue;
+      const files = findJsFiles(dir);
+      for (const file of files) {
+        try {
+          const content = fs.readFileSync(file, 'utf8');
+          for (const [key, val] of secretEntries) {
+            if (content.includes(val)) {
+              leaks.push({ type: 'file', path: path.relative(projectRoot, file), key });
+            }
+          }
+        } catch {}
+      }
+    }
+
+    // 3. Check if .env file exists in any served directory
+    for (const dir of staticDirs) {
+      const envPath = path.join(dir, '.env');
+      if (fs.existsSync(envPath)) {
+        leaks.push({ type: 'file', path: path.relative(projectRoot, envPath), key: '.env_in_public_dir' });
+      }
+    }
+
+    res.json({
+      pass: leaks.length === 0,
+      scanned: secretEntries.length,
+      leaks,
+    });
+  });
+
   // ── GET /security-logs — Suspicious nginx log entries since last pull ────
   // Returns { events: [...], offset: <new_offset> }.
   // Caller should pass ?offset=<n> to resume from where it left off.
