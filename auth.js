@@ -85,10 +85,10 @@ function createAuthMiddleware(opts = {}) {
       return { ok: false, status: 401, error: 'Invalid or expired token' };
     }
 
-    const email = (payload.email || '').toLowerCase();
-    if (!email || !payload.sub) {
+    if (!payload.sub) {
       return { ok: false, status: 401, error: 'Invalid token payload' };
     }
+    const email = payload.email ? payload.email.toLowerCase() : null;
 
     return { ok: true, userId: payload.sub, email };
   }
@@ -137,7 +137,7 @@ function createAuthMiddleware(opts = {}) {
       }
       const r = await extractBearer(req);
       if (!r.ok) return res.status(r.status).json({ error: r.error });
-      if (r.email !== SUPER_ADMIN_EMAIL) {
+      if (!r.email || r.email !== SUPER_ADMIN_EMAIL) {
         return res.status(403).json({ error: 'Admin access required' });
       }
       req.user = { userId: r.userId, email: r.email };
