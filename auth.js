@@ -2,7 +2,7 @@
 
 // publicwerx-core/auth.js — RS256 auth middleware for the PublicWerx fleet.
 //
-// All identity is owned by auth.surajshetty.com. Consumer apps verify access
+// All identity is owned by auth.publicwerx.org. Consumer apps verify access
 // tokens locally using the auth service's RS256 public key (fetched once and
 // cached). This module extracts the copy-pasted verification + middleware
 // logic that was identical across njordfellfutures, peerlinq, gottapickone,
@@ -21,8 +21,8 @@ const jwt = require('jsonwebtoken');
 
 /**
  * @param {Object} opts
- * @param {string}   [opts.authServiceUrl='https://auth.surajshetty.com']
- * @param {string}   [opts.issuer='auth.surajshetty.com']
+ * @param {string}   [opts.authServiceUrl='https://auth.publicwerx.org']
+ * @param {string}   [opts.issuer='auth.publicwerx.org']
  * @param {string}   [opts.superAdminEmail]  — lowercase. If unset, requireAdmin always 403s.
  * @param {Function} [opts.onUser]           — (userId, email) => void. Called on successful
  *                                              requireAuth/optionalAuth for lazy user creation.
@@ -30,8 +30,8 @@ const jwt = require('jsonwebtoken');
  *                                              project_gpo_admin_gate.md).
  */
 function createAuthMiddleware(opts = {}) {
-  const AUTH_SERVICE_URL = opts.authServiceUrl || 'https://auth.surajshetty.com';
-  const AUTH_SERVICE_ISSUER = opts.issuer || 'auth.surajshetty.com';
+  const AUTH_SERVICE_URL = opts.authServiceUrl || 'https://auth.publicwerx.org';
+  const AUTH_SERVICE_ISSUER = opts.issuer || 'auth.publicwerx.org';
   const SUPER_ADMIN_EMAIL = (opts.superAdminEmail || '').toLowerCase();
   const onUser = typeof opts.onUser === 'function' ? opts.onUser : null;
 
