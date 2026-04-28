@@ -1,6 +1,6 @@
 {
   "name": "publicwerx-core",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "description": "Shared chassis for PublicWerx projects: auth middleware (RS256 via auth.surajshetty.com) and system health/deploy routes.",
   "main": "index.js",
   "files": ["index.js", "auth.js", "system.js"],
