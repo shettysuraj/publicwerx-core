@@ -19,7 +19,7 @@
 //
 //   app.get('/api/me', auth.requireAuth, (req, res) => { ... });
 
-const { createAuthMiddleware } = require('./auth');
+const { createAuthMiddleware, isSubscribed } = require('./auth');
 const { createSystemRoutes } = require('./system');
 
-module.exports = { createAuthMiddleware, createSystemRoutes };
+module.exports = { createAuthMiddleware, createSystemRoutes, isSubscribed };

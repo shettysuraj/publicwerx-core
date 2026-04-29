@@ -90,7 +90,7 @@ function createAuthMiddleware(opts = {}) {
     }
     const email = payload.email ? payload.email.toLowerCase() : null;
 
-    return { ok: true, userId: payload.sub, email, firstName: payload.first_name || null, lastName: payload.last_name || null };
+    return { ok: true, userId: payload.sub, email, firstName: payload.first_name || null, lastName: payload.last_name || null, subscribedApps: payload.sub_apps || null };
   }
 
   // ── Middleware: requireAuth ──────────────────────────────────────────────
@@ -100,7 +100,7 @@ function createAuthMiddleware(opts = {}) {
     try {
       const r = await extractBearer(req);
       if (!r.ok) return res.status(r.status).json({ error: r.error });
-      req.user = { userId: r.userId, email: r.email, firstName: r.firstName, lastName: r.lastName };
+      req.user = { userId: r.userId, email: r.email, firstName: r.firstName, lastName: r.lastName, subscribedApps: r.subscribedApps };
       if (onUser) onUser(r.userId, r.email);
       next();
     } catch (err) {
@@ -116,7 +116,7 @@ function createAuthMiddleware(opts = {}) {
     try {
       const r = await extractBearer(req);
       if (r.ok) {
-        req.user = { userId: r.userId, email: r.email, firstName: r.firstName, lastName: r.lastName };
+        req.user = { userId: r.userId, email: r.email, firstName: r.firstName, lastName: r.lastName, subscribedApps: r.subscribedApps };
         if (onUser) onUser(r.userId, r.email);
       }
     } catch {
@@ -140,7 +140,7 @@ function createAuthMiddleware(opts = {}) {
       if (!r.email || r.email !== SUPER_ADMIN_EMAIL) {
         return res.status(403).json({ error: 'Admin access required' });
       }
-      req.user = { userId: r.userId, email: r.email, firstName: r.firstName, lastName: r.lastName };
+      req.user = { userId: r.userId, email: r.email, firstName: r.firstName, lastName: r.lastName, subscribedApps: r.subscribedApps };
       next();
     } catch (err) {
       console.error('[publicwerx-core:admin] middleware error:', err.message);
@@ -152,10 +152,15 @@ function createAuthMiddleware(opts = {}) {
     requireAuth,
     optionalAuth,
     requireAdmin,
-    // Exposed for advanced use (e.g. Socket.IO handshake verification)
     verifyAuthToken,
     getAuthPublicKey,
   };
 }
 
-module.exports = { createAuthMiddleware };
+function isSubscribed(user, appId) {
+  if (!user?.subscribedApps) return false;
+  if (user.subscribedApps === 'all') return true;
+  return Array.isArray(user.subscribedApps) && user.subscribedApps.includes(appId);
+}
+
+module.exports = { createAuthMiddleware, isSubscribed };
