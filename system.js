@@ -720,13 +720,14 @@ function createSystemRoutes(opts = {}) {
   }
 
   function checkOtel() {
-    try {
-      const status = execSync('systemctl is-active otelcol-contrib 2>/dev/null', { timeout: 3000 })
-        .toString().trim();
-      return { status: status === 'active' ? 'pass' : 'warn', systemd: status };
-    } catch {
-      return { status: 'warn', systemd: 'unknown' };
+    for (const svc of ['otelcol-contrib', 'otelcol']) {
+      try {
+        const status = execSync(`systemctl is-active ${svc} 2>/dev/null`, { timeout: 3000 })
+          .toString().trim();
+        if (status === 'active') return { status: 'pass', systemd: status, unit: svc };
+      } catch {}
     }
+    return { status: 'warn', systemd: 'unknown' };
   }
 
   function checkSqlite(db) {
