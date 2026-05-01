@@ -147,6 +147,13 @@ async function s3Put(bucket, key, body) {
  * @param {string}  [opts.backup.s3Bucket]        — S3 bucket name. If set, backups are also uploaded
  *                                                   to s3://{bucket}/backups/{label}/{filename}.
  *                                                   Uses EC2 IAM instance role credentials (IMDSv2).
+ * @param {Object}  [opts.health]                 — configure the GET /health verdict endpoint.
+ * @param {string}  [opts.health.serviceName]     — service identifier in health response (default: hostname).
+ * @param {Object}  [opts.health.sqlite]          — better-sqlite3 Database instance. Runs read + integrity check.
+ * @param {boolean} [opts.health.s3]              — if true, verifies IMDSv2 credentials are available.
+ * @param {string[]} [opts.health.ssl]            — domain names to check SSL certificate expiry.
+ * @param {string}  [opts.health.authUrl]         — auth service URL to probe (omit for the auth service itself).
+ * @param {Object}  [opts.health.custom]          — map of name → async function returning { status: 'pass'|'warn'|'fail', ... }.
  */
 function createSystemRoutes(opts = {}) {
   if (!opts.systemKey) {
@@ -628,6 +635,247 @@ function createSystemRoutes(opts = {}) {
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
+  });
+
+  // ── GET /health — Structured health verdict for autonomous operations ──
+  // Box-level checks always run. App-level checks are opt-in via opts.health.
+  //
+  // Usage:
+  //   createSystemRoutes({
+  //     systemKey: '...',
+  //     health: {
+  //       serviceName: 'aapta',
+  //       sqlite: db,                              // better-sqlite3 instance
+  //       s3: true,                                 // check IMDSv2 creds
+  //       ssl: ['aapta.publicwerx.org'],            // check cert expiry
+  //       authUrl: 'https://auth.publicwerx.org',   // check auth reachability
+  //       custom: { name: async () => ({ status: 'pass' }) }
+  //     }
+  //   });
+  //
+  // Response: { status: 'healthy'|'degraded'|'unhealthy', service, checks: {...} }
+
+  const HEALTH = opts.health || {};
+  const SERVICE_NAME = HEALTH.serviceName || os.hostname();
+
+  function checkDisk() {
+    try {
+      const df = execSync('df -h / | tail -1', { timeout: 3000 }).toString().trim().split(/\s+/);
+      const pct = parseInt(df[4], 10);
+      return {
+        status: pct > 90 ? 'fail' : pct > 80 ? 'warn' : 'pass',
+        use_pct: pct,
+        available: df[3],
+      };
+    } catch (err) {
+      return { status: 'fail', error: err.message };
+    }
+  }
+
+  function checkMemory() {
+    const total = os.totalmem();
+    const free = os.freemem();
+    const pct = Math.round((1 - free / total) * 100);
+    return {
+      status: pct > 90 ? 'fail' : pct > 80 ? 'warn' : 'pass',
+      use_pct: pct,
+      free_mb: Math.round(free / 1024 / 1024),
+    };
+  }
+
+  function checkPm2() {
+    try {
+      const raw = execSync('pm2 jlist 2>/dev/null', { timeout: 5000 }).toString();
+      const procs = JSON.parse(raw);
+      const down = procs.filter(p => p.pm2_env?.status !== 'online');
+      return {
+        status: down.length > 0 ? 'warn' : 'pass',
+        total: procs.length,
+        online: procs.length - down.length,
+        down: down.map(p => p.name),
+      };
+    } catch (err) {
+      return { status: 'fail', error: err.message };
+    }
+  }
+
+  function checkProcessHealth() {
+    const mem = process.memoryUsage();
+    return {
+      status: 'pass',
+      uptime_s: Math.floor(process.uptime()),
+      rss_mb: Math.round(mem.rss / 1024 / 1024),
+      heap_mb: Math.round(mem.heapUsed / 1024 / 1024),
+    };
+  }
+
+  function checkNginx() {
+    try {
+      const status = execSync('systemctl is-active nginx 2>/dev/null', { timeout: 3000 })
+        .toString().trim();
+      return { status: status === 'active' ? 'pass' : 'fail', systemd: status };
+    } catch {
+      return { status: 'fail', systemd: 'unknown' };
+    }
+  }
+
+  function checkOtel() {
+    try {
+      const status = execSync('systemctl is-active otelcol-contrib 2>/dev/null', { timeout: 3000 })
+        .toString().trim();
+      return { status: status === 'active' ? 'pass' : 'warn', systemd: status };
+    } catch {
+      return { status: 'warn', systemd: 'unknown' };
+    }
+  }
+
+  function checkSqlite(db) {
+    try {
+      const readStart = Date.now();
+      db.prepare('SELECT 1').get();
+      const readMs = Date.now() - readStart;
+
+      const intStart = Date.now();
+      const result = db.pragma('quick_check(1)');
+      const intMs = Date.now() - intStart;
+      const ok = result?.[0]?.quick_check === 'ok';
+
+      return {
+        status: ok ? 'pass' : 'fail',
+        read_ms: readMs,
+        integrity_ms: intMs,
+        integrity: ok,
+      };
+    } catch (err) {
+      return { status: 'fail', error: err.message };
+    }
+  }
+
+  async function checkS3Creds() {
+    try {
+      const start = Date.now();
+      const creds = await getInstanceCredentials();
+      const ms = Date.now() - start;
+      if (!creds.AccessKeyId) return { status: 'fail', error: 'no credentials' };
+
+      const expiration = new Date(creds.Expiration);
+      const minutesLeft = Math.round((expiration - Date.now()) / 60000);
+
+      return {
+        status: minutesLeft < 5 ? 'warn' : 'pass',
+        ms,
+        creds_expire_min: minutesLeft,
+      };
+    } catch (err) {
+      return { status: 'fail', error: err.message };
+    }
+  }
+
+  async function checkSsl(domains) {
+    const results = {};
+    let worstStatus = 'pass';
+    const DOMAIN_RE = /^[a-z0-9.-]+$/i;
+
+    for (const domain of domains) {
+      if (!DOMAIN_RE.test(domain)) {
+        results[domain] = { status: 'fail', error: 'invalid domain' };
+        worstStatus = 'fail';
+        continue;
+      }
+      try {
+        const raw = execSync(
+          `echo | openssl s_client -servername "${domain}" -connect "${domain}:443" 2>/dev/null | openssl x509 -noout -enddate`,
+          { timeout: 10000 },
+        ).toString().trim();
+        const dateStr = raw.replace('notAfter=', '');
+        const expiry = new Date(dateStr);
+        const daysLeft = Math.floor((expiry - Date.now()) / 86400000);
+
+        let status = 'pass';
+        if (daysLeft < 7) { status = 'fail'; worstStatus = 'fail'; }
+        else if (daysLeft < 14) { status = 'warn'; if (worstStatus !== 'fail') worstStatus = 'warn'; }
+
+        results[domain] = { status, days_remaining: daysLeft };
+      } catch (err) {
+        results[domain] = { status: 'fail', error: err.message };
+        worstStatus = 'fail';
+      }
+    }
+
+    return { status: worstStatus, domains: results };
+  }
+
+  async function checkAuthService(url) {
+    try {
+      const start = Date.now();
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 5000);
+      const r = await fetch(`${url}/auth/public-key`, { signal: ctrl.signal });
+      clearTimeout(t);
+      return {
+        status: r.ok ? 'pass' : 'warn',
+        ms: Date.now() - start,
+        http_status: r.status,
+      };
+    } catch (err) {
+      return { status: 'warn', error: err.message };
+    }
+  }
+
+  router.get('/health', async (req, res) => {
+    const checks = {};
+
+    // Box-level checks (always)
+    checks.disk = checkDisk();
+    checks.memory = checkMemory();
+    checks.pm2 = checkPm2();
+    checks.process = checkProcessHealth();
+    checks.nginx = checkNginx();
+    checks.otel = checkOtel();
+
+    // App-level checks (opt-in)
+    const promises = [];
+
+    if (HEALTH.sqlite) {
+      checks.sqlite = checkSqlite(HEALTH.sqlite);
+    }
+    if (HEALTH.s3) {
+      promises.push(checkS3Creds().then(r => { checks.s3 = r; }));
+    }
+    if (HEALTH.ssl?.length) {
+      promises.push(checkSsl(HEALTH.ssl).then(r => { checks.ssl = r; }));
+    }
+    if (HEALTH.authUrl) {
+      promises.push(checkAuthService(HEALTH.authUrl).then(r => { checks.auth = r; }));
+    }
+
+    // Custom checks
+    if (HEALTH.custom) {
+      for (const [name, fn] of Object.entries(HEALTH.custom)) {
+        promises.push(
+          Promise.resolve().then(fn)
+            .then(r => { checks[name] = r; })
+            .catch(err => { checks[name] = { status: 'fail', error: err.message }; }),
+        );
+      }
+    }
+
+    if (promises.length) await Promise.all(promises);
+
+    // Derive overall status from worst individual check
+    let status = 'healthy';
+    for (const check of Object.values(checks)) {
+      if (check.status === 'fail') { status = 'unhealthy'; break; }
+      if (check.status === 'warn') status = 'degraded';
+    }
+
+    res.json({
+      status,
+      service: SERVICE_NAME,
+      timestamp: new Date().toISOString(),
+      uptime: Math.floor(process.uptime()),
+      checks,
+    });
   });
 
   return router;
