@@ -174,8 +174,16 @@ function createSystemRoutes(opts = {}) {
   const router = express.Router();
 
   // ── Auth: shared secret ─────────────────────────────────────────────────
+  // Constant-time comparison to remove the (theoretical) timing-leak channel.
+  const SYSTEM_KEY_BUF = Buffer.from(SYSTEM_KEY);
+  function safeKeyMatch(provided) {
+    if (typeof provided !== 'string') return false;
+    const buf = Buffer.from(provided);
+    if (buf.length !== SYSTEM_KEY_BUF.length) return false;
+    return crypto.timingSafeEqual(buf, SYSTEM_KEY_BUF);
+  }
   router.use((req, res, next) => {
-    if (req.headers['x-system-key'] !== SYSTEM_KEY) {
+    if (!safeKeyMatch(req.headers['x-system-key'])) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
     next();
