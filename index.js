@@ -21,5 +21,6 @@
 
 const { createAuthMiddleware, isSubscribed } = require('./auth');
 const { createSystemRoutes } = require('./system');
+const { installCrashGuard } = require('./crash-guard');
 
-module.exports = { createAuthMiddleware, createSystemRoutes, isSubscribed };
+module.exports = { createAuthMiddleware, createSystemRoutes, isSubscribed, installCrashGuard };
