@@ -22,5 +22,14 @@
 const { createAuthMiddleware, isSubscribed } = require('./auth');
 const { createSystemRoutes } = require('./system');
 const { installCrashGuard } = require('./crash-guard');
+const { createCronRunner, dailyAtUtc, weeklyAtUtc } = require('./cron');
 
-module.exports = { createAuthMiddleware, createSystemRoutes, isSubscribed, installCrashGuard };
+module.exports = {
+  createAuthMiddleware,
+  createSystemRoutes,
+  isSubscribed,
+  installCrashGuard,
+  createCronRunner,
+  dailyAtUtc,
+  weeklyAtUtc,
+};
